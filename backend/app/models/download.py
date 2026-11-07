@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from enum import Enum
 from datetime import datetime
 
@@ -25,14 +25,52 @@ class DownloadSegment(BaseModel):
 class DownloadRequest(BaseModel):
     """下载请求模型"""
     video_id: str
-    filename: Optional[str] = None
-    force: Optional[bool] = False
+    filename: Optional[str] = None      # 自定义文件名模板，留空则使用全局设置
+    sub_path: Optional[str] = None      # 自定义子路径模板，留空则使用全局设置
+    force: Optional[bool] = False       # 二次确认后置为 True，会覆盖已有记录
 
 
 class DownloadAction(BaseModel):
     """下载操作模型"""
     video_id: str
     action: str  # 'pause', 'resume', 'cancel', 'retry', 'delete'
+
+
+class DownloadSettings(BaseModel):
+    """下载命名设置"""
+    sub_path_template: str = ""
+    filename_template: str = "{video_id}_{title}"
+    variables: List[Dict[str, str]] = Field(default_factory=list, description="可用变量说明")
+    examples: List[Dict[str, Any]] = Field(default_factory=list, description="预设模板示例")
+
+
+class PathPreviewRequest(BaseModel):
+    """路径预览请求"""
+    video_id: str
+    sub_path: Optional[str] = None
+    filename: Optional[str] = None
+
+
+class PathPreview(BaseModel):
+    """路径预览结果"""
+    sub_path: str = ""
+    filename: str = ""
+    rel_path: str = ""
+    absolute_path: str = ""
+    exists: bool = False
+    variables: Dict[str, str] = Field(default_factory=dict)
+
+
+class DownloadConflict(BaseModel):
+    """下载冲突信息（用于前端二次确认）"""
+    type: str = ""                      # in_progress / completed / completed_missing / file_exists
+    title: str = ""
+    message: str = ""
+    detail: str = ""
+    existing_status: Optional[str] = None
+    existing_progress: Optional[float] = None
+    existing_size: Optional[int] = None
+    rel_path: Optional[str] = None
 
 
 class DownloadProgress(BaseModel):
@@ -52,6 +90,10 @@ class DownloadProgress(BaseModel):
     retry_count: int = 0
     max_retries: int = 3
     segments: Optional[List[DownloadSegment]] = None
+    # 自定义路径相关
+    sub_path: str = ""
+    rel_path: str = ""
+    variables: Optional[Dict[str, str]] = None
 
 
 class DownloadConfig(BaseModel):

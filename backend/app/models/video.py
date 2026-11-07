@@ -54,6 +54,7 @@ class VideoDetail(VideoPreview):
     """视频详情模型"""
     description: Optional[str] = ""
     subtitle: Optional[str] = ""
+    series: Optional[str] = Field(default="", description="所属系列名称，解析不到时为空")
     upload_date: Optional[datetime] = ""
     video_type: Optional[VideoType] = None
     default_video_url: Optional[str] = ""

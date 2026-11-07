@@ -43,6 +43,13 @@ class Settings(BaseModel):
     DB_PATH: Path = Path(os.getenv("DB_PATH", str(backend_root / "db")))
     COVER_PATH: Path = Path(os.getenv("COVER_PATH", str(backend_root / "downloads" / "covers")))
 
+    # 下载命名模板（可在页面上覆盖，数据库中保存的设置优先级更高）
+    # 可用变量见 app/utils/path_template.py::VARIABLES
+    DOWNLOAD_SUB_PATH_TEMPLATE: str = os.getenv("DOWNLOAD_SUB_PATH_TEMPLATE", "")
+    DOWNLOAD_FILENAME_TEMPLATE: str = os.getenv(
+        "DOWNLOAD_FILENAME_TEMPLATE", "{video_id}_{title}"
+    )
+
     # 爬虫设置
     USER_AGENT: str = os.getenv("USER_AGENT","Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
 

@@ -6,6 +6,9 @@
         
         <!-- 普通模式下的批量操作按钮 -->
         <div v-if="!downloadStore.batchDeleteMode" class="bulk-actions">
+          <el-button @click="openSettings" title="自定义下载子路径与文件名">
+            <el-icon><Setting /></el-icon> 命名设置
+          </el-button>
           <el-button-group>
             <el-button :disabled="!activeDownloads.length" @click="pauseAllDownloads" type="primary">
               <el-icon><VideoPause /></el-icon> 全部暂停
@@ -140,6 +143,12 @@
         />
       </div>
     </el-dialog>
+
+    <!-- 下载命名设置 -->
+    <DownloadPathDialog
+      v-model="settingsDialogVisible"
+      mode="settings"
+    />
   </div>
 </template>
 
@@ -149,6 +158,7 @@ import { useDownloadStore } from '../stores/download';
 import { storeToRefs } from 'pinia';
 import DownloadList from '../components/DownloadList.vue';
 import VideoPlayer from '../components/VideoPlayer.vue';
+import DownloadPathDialog from '../components/DownloadPathDialog.vue';
 import { VideoPause, VideoPlay, ArrowDown, Delete, RefreshRight, Download, Refresh, Select, Close, Back, CloseBold } from '@element-plus/icons-vue';
 import { ElMessageBox, ElMessage } from 'element-plus';
 import { DownloadApi } from '../api/download';
@@ -171,6 +181,12 @@ const confirmDialogVisible = ref(false);
 const confirmDialogTitle = ref('');
 const confirmDialogMessage = ref('');
 const pendingAction = ref('');
+
+// 下载命名设置弹窗
+const settingsDialogVisible = ref(false);
+const openSettings = () => {
+  settingsDialogVisible.value = true;
+};
 
 // 视频播放相关状态
 const videoPlayerVisible = ref(false);

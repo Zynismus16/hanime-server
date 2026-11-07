@@ -432,6 +432,9 @@ class VideoService:
             # 使用辅助方法提取系列视频
             series_videos = self._extract_series_videos(page_ele)
 
+            # 系列名称（供下载路径模板使用，解析不到则为空）
+            series_title = self._extract_series_title(page_ele)
+
             # 使用辅助方法提取相关视频（两种类型）
             basic_related_videos = self._extract_related_videos_based(page_ele)
             detailed_related_videos = self._extract_related_videos_detailed(page_ele)
@@ -441,6 +444,7 @@ class VideoService:
                 video_id=video_id,
                 title=video_title,
                 subtitle=to_simplified(subtitle),
+                series=to_simplified(series_title),
                 cover_url=cover_url,
                 description=to_simplified(description),
                 default_video_url=default_video_url,
@@ -793,6 +797,37 @@ class VideoService:
                 related_videos.append(video_info)
 
         return self._dedup_by_id(related_videos)
+
+    # 辅助方法，提取系列名称
+    def _extract_series_title(self, page_ele) -> str:
+        """
+        提取「系列」名称，仅用于下载路径模板的 {series} 变量。
+
+        站点不同模板下系列标题的位置不一致，这里按候选选择器依次尝试，
+        全部失败则返回空串（模板中该层级会被自动丢弃，不影响下载）。
+        """
+        candidates = [
+            'xpath://*[@id="playlist-title"]',
+            'xpath://*[contains(@class, "playlist-title")]',
+            'xpath://*[@id="playlist-scroll"]/preceding::*[contains(@class, "section-title")][1]',
+            'xpath://*[@id="playlist-scroll"]/preceding::*[contains(@class, "video-caption")][1]',
+        ]
+
+        ignored = {"系列", "播放列表", "播放清單", "playlist", "series"}
+        for xpath in candidates:
+            try:
+                ele = page_ele.ele(xpath)
+            except Exception:
+                continue
+            if not ele:
+                continue
+            text = (ele.text or "").strip()
+            # 去掉「系列：xxx」这类前缀
+            text = re.split(r"[:：]", text, maxsplit=1)[-1].strip()
+            if text and text.lower() not in ignored and len(text) <= 80:
+                return text
+
+        return ""
 
     # 辅助方法，提取系列视频信息
     def _extract_series_videos(self, page_ele) -> List[VideoPreview]:

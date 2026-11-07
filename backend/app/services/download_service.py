@@ -10,6 +10,7 @@ import httpx
 import aiosqlite
 from app.models.download import DownloadStatus, DownloadSegment, DownloadProgress
 from app.services.video_service import VideoService
+from app.utils import path_template
 from app.config import settings, logger
 import aiofiles
 import aiofiles.os
@@ -71,7 +72,9 @@ class DownloadManager:
         # 数据库路径
         self.db_path = settings.DB_PATH / "downloads.db"
 
-    
+    # ------------------------------------------------------------------
+    # 数据库初始化与迁移
+    # ------------------------------------------------------------------
     async def init_db(self):
         """初始化数据库"""
         async with aiosqlite.connect(self.db_path) as conn:
@@ -89,10 +92,135 @@ class DownloadManager:
                 completed_at TIMESTAMP,
                 error_message TEXT,
                 retry_count INTEGER DEFAULT 0,
-                max_retries INTEGER DEFAULT 3
+                max_retries INTEGER DEFAULT 3,
+                sub_path TEXT DEFAULT '',
+                rel_path TEXT,
+                vars TEXT
+            )
+            """)
+            # 下载命名设置（键值表）
+            await conn.execute("""
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """)
             await conn.commit()
+            await self._migrate_schema(conn)
+
+    async def _migrate_schema(self, conn: aiosqlite.Connection) -> None:
+        """
+        为老版本数据库补充新增字段（幂等）。
+
+        老库只有 filename（纯文件名），新增 rel_path 表示「子路径/文件名」，
+        迁移时用 filename 回填，保证已下载文件仍能被正确定位。
+        """
+        async with conn.execute("PRAGMA table_info(downloads)") as cursor:
+            columns = {row[1] for row in await cursor.fetchall()}
+
+        additions = {
+            "sub_path": "TEXT DEFAULT ''",
+            "rel_path": "TEXT",
+            "vars": "TEXT",
+        }
+        for column, ddl in additions.items():
+            if column not in columns:
+                await conn.execute(f"ALTER TABLE downloads ADD COLUMN {column} {ddl}")
+                logger.info(f"数据库迁移：downloads 新增字段 {column}")
+
+        await conn.execute(
+            "UPDATE downloads SET rel_path = filename WHERE rel_path IS NULL OR rel_path = ''"
+        )
+        await conn.commit()
+
+    # ------------------------------------------------------------------
+    # 路径工具
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _rel_path_of(record: Any) -> str:
+        """从数据库行 / 字典中取出相对路径，兼容旧库只有 filename 的情况"""
+        try:
+            rel = record["rel_path"]
+        except (KeyError, IndexError, TypeError):
+            rel = None
+        if not rel:
+            try:
+                rel = record["filename"]
+            except (KeyError, IndexError, TypeError):
+                rel = ""
+        return rel or ""
+
+    def _absolute_path(self, rel_path: str):
+        """相对路径 → 绝对路径（带越界保护）"""
+        base = settings.DOWNLOAD_PATH.resolve()
+        target = (settings.DOWNLOAD_PATH / rel_path).resolve()
+        if target != base and base not in target.parents:
+            raise ValueError(f"非法的下载路径: {rel_path}")
+        return settings.DOWNLOAD_PATH / rel_path
+
+    def absolute_path_of(self, record: Any):
+        """下载记录 → 绝对路径（对外提供）"""
+        return self._absolute_path(self._rel_path_of(record))
+
+    async def get_download_settings(self) -> Dict[str, str]:
+        """读取下载命名设置（数据库优先，其次环境变量默认值）"""
+        result = {
+            "sub_path_template": settings.DOWNLOAD_SUB_PATH_TEMPLATE or "",
+            "filename_template": settings.DOWNLOAD_FILENAME_TEMPLATE or path_template.DEFAULT_FILENAME_TEMPLATE,
+        }
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT key, value FROM app_settings WHERE key IN ('sub_path_template', 'filename_template')"
+            ) as cursor:
+                for row in await cursor.fetchall():
+                    if row["value"] is not None:
+                        result[row["key"]] = row["value"]
+        return result
+
+    async def save_download_settings(self, sub_path_template: str, filename_template: str) -> Dict[str, str]:
+        """
+        保存下载命名设置
+
+        会先校验模板：未知变量、`..` 等非法内容直接拒绝，避免后续下载时才失败。
+        """
+        sub_path_template = (sub_path_template or "").strip()
+        filename_template = (filename_template or "").strip() or path_template.DEFAULT_FILENAME_TEMPLATE
+
+        path_template.validate_template(sub_path_template, "子路径模板")
+        path_template.validate_template(filename_template, "文件名模板")
+
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP",
+                ("sub_path_template", sub_path_template),
+            )
+            await db.execute(
+                "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP",
+                ("filename_template", filename_template),
+            )
+            await db.commit()
+
+        logger.info(f"下载命名设置已更新: 子路径='{sub_path_template}' 文件名='{filename_template}'")
+        return {"sub_path_template": sub_path_template, "filename_template": filename_template}
+
+    def _resolve_target(
+        self,
+        video_detail,
+        sub_path_template: str,
+        filename_template: str,
+        quality: str = "",
+    ):
+        """根据视频详情 + 模板，解析出 (相对路径, 绝对路径, 变量表)"""
+        variables = path_template.build_variables(video_detail, quality=quality, ext="mp4")
+        rel_path = path_template.build_relative_path(
+            sub_path_template, filename_template, variables
+        )
+        abs_path = self._absolute_path(rel_path)
+        return rel_path, abs_path, variables
     
     async def get_download_history(self) -> List[Dict[str, Any]]:
         """获取下载历史"""
@@ -102,7 +230,18 @@ class DownloadManager:
                 "SELECT * FROM downloads ORDER BY created_at DESC"
             ) as cursor:
                 rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+                history = []
+                for row in rows:
+                    item = dict(row)
+                    # 兼容旧库：rel_path 为空时回退到 filename
+                    item["rel_path"] = self._rel_path_of(item)
+                    item["sub_path"] = item.get("sub_path") or ""
+                    try:
+                        item["exists"] = self._absolute_path(item["rel_path"]).exists()
+                    except ValueError:
+                        item["exists"] = False
+                    history.append(item)
+                return history
 
     async def load_downloads(self):
         """从数据库加载下载历史"""
@@ -137,7 +276,10 @@ class DownloadManager:
                         created_at=row['created_at'],
                         completed_at=row['completed_at'],
                         retry_count=retry_count,
-                        max_retries=max_retries
+                        max_retries=max_retries,
+                        sub_path=row['sub_path'] or "",
+                        rel_path=self._rel_path_of(row),
+                        variables=json.loads(row['vars']) if row['vars'] else None
                     )
                     # 恢复暂停状态
                     if row['status'] == DownloadStatus.PAUSED:
@@ -147,7 +289,7 @@ class DownloadManager:
                         self.pause_events[video_id] = asyncio.Event()
                         self.pause_events[video_id].set()
                         # 重新启动下载
-                        output_path = settings.DOWNLOAD_PATH / row['filename']
+                        output_path = self._absolute_path(self._rel_path_of(row))
                         asyncio.create_task(
                             self.download_file(
                                 video_id,
@@ -832,7 +974,10 @@ class DownloadManager:
                         created_at=download['created_at'],
                         completed_at=None,
                         retry_count=retry_count,
-                        max_retries=max_retries
+                        max_retries=max_retries,
+                        sub_path=download['sub_path'] or "",
+                        rel_path=self._rel_path_of(download),
+                        variables=json.loads(download['vars']) if download['vars'] else None
                     )
                     
                 # 如果有暂停事件，设置它以继续下载
@@ -843,7 +988,7 @@ class DownloadManager:
                     self.pause_events[video_id].set()
                 
                 # 启动重试下载任务
-                output_path = settings.DOWNLOAD_PATH / download["filename"]
+                output_path = self._absolute_path(self._rel_path_of(download))
                 asyncio.create_task(
                     self.download_file(
                         video_id,
@@ -912,22 +1057,32 @@ class DownloadManager:
             async with aiosqlite.connect(self.db_path) as db:
                 # 获取文件名
                 async with db.execute(
-                    "SELECT filename, status FROM downloads WHERE video_id = ?",
+                    "SELECT filename, status, rel_path FROM downloads WHERE video_id = ?",
                     (video_id,)
                 ) as cursor:
                     row = await cursor.fetchone()
                     if not row:
                         return False  # 记录不存在
                         
-                    filename = row[0]
+                    rel_path = row[2] or row[0]
                     status = row[1]
                     
                     # 删除文件（如果是部分下载的文件也要删除）
-                    file_path = settings.DOWNLOAD_PATH / filename
+                    file_path = self._absolute_path(rel_path)
                     try:
                         if await aiofiles.os.path.exists(file_path):
                             await aiofiles.os.remove(file_path)
                             logger.info(f"删除文件成功: {file_path}")
+                        # 顺带清理因此变空的子目录（不递归删除非空目录）
+                        parent = file_path.parent
+                        base_dir = settings.DOWNLOAD_PATH.resolve()
+                        while parent.resolve() != base_dir and base_dir in parent.resolve().parents:
+                            try:
+                                await aiofiles.os.rmdir(parent)
+                                logger.info(f"清理空目录: {parent}")
+                            except OSError:
+                                break
+                            parent = parent.parent
                     except Exception as file_error:
                         logger.error(f"删除文件失败: {str(file_error)}")
                         # 继续删除数据库记录，即使文件删除失败
@@ -954,74 +1109,240 @@ class DownloadManager:
             logger.error(f"删除下载失败: {str(e)}")
             return False
 
-    async def start_download(self, video_id: str, force: bool = False):
+    # ------------------------------------------------------------------
+    # 下载冲突检测
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _format_size(size: Optional[int]) -> str:
+        if not size or size <= 0:
+            return "未知大小"
+        value = float(size)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if value < 1024 or unit == "TB":
+                return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+            value /= 1024
+        return f"{value:.1f} TB"
+
+    def _conflict_from_record(self, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        根据已有下载记录判断是否存在冲突
+
+        失败 / 已取消的记录不视为冲突（可以直接重新下载），
+        只有「正在进行」和「已完成」才需要用户二次确认。
+        """
+        status = record.get("status") or ""
+        rel_path = self._rel_path_of(record)
+        title = record.get("title") or ""
+        total = record.get("total_size") or 0
+        downloaded = record.get("downloaded") or 0
+        progress = round(downloaded / total * 100, 1) if total else 0
+
+        if status in (DownloadStatus.DOWNLOADING, DownloadStatus.PENDING, DownloadStatus.PAUSED):
+            label = {
+                DownloadStatus.DOWNLOADING: "正在下载",
+                DownloadStatus.PENDING: "等待下载",
+                DownloadStatus.PAUSED: "已暂停",
+            }.get(status, status)
+            return {
+                "type": "in_progress",
+                "title": title,
+                "message": "该视频已在下载列表中",
+                "detail": f"当前状态：{label}（{self._format_size(downloaded)} / {self._format_size(total)}）",
+                "existing_status": status,
+                "existing_progress": progress,
+                "existing_size": total,
+                "rel_path": rel_path,
+            }
+
+        if status == DownloadStatus.COMPLETED:
+            file_exists = False
+            try:
+                file_exists = self._absolute_path(rel_path).exists()
+            except ValueError:
+                file_exists = False
+
+            if file_exists:
+                return {
+                    "type": "completed",
+                    "title": title,
+                    "message": "该视频已下载完成",
+                    "detail": f"文件：{rel_path}（{self._format_size(total)}）",
+                    "existing_status": status,
+                    "existing_progress": 100.0,
+                    "existing_size": total,
+                    "rel_path": rel_path,
+                }
+            return {
+                "type": "completed_missing",
+                "title": title,
+                "message": "下载记录存在，但文件已不存在",
+                "detail": f"原文件：{rel_path}",
+                "existing_status": status,
+                "existing_progress": None,
+                "existing_size": total,
+                "rel_path": rel_path,
+            }
+
+        return None
+
+    async def check_download_conflict(
+        self, video_id: str, sub_path: Optional[str] = None, filename: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        供前端在点击下载前调用：判断是否需要弹出二次确认
+
+        Returns:
+            {"has_conflict": bool, "conflict": {...} | None, "settings": {...}}
+        """
+        existing = await self.check_existing_download(video_id)
+        conflict = self._conflict_from_record(existing) if existing else None
+        return {
+            "has_conflict": conflict is not None,
+            "conflict": conflict,
+            "existing": existing,
+            "settings": await self.get_download_settings(),
+        }
+
+    async def preview_target(
+        self, video_id: str, sub_path: Optional[str] = None, filename: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """按模板预览落盘位置（不创建任何文件）"""
+        config = await self.get_download_settings()
+        sub_tpl = sub_path if sub_path not in (None, "") else config["sub_path_template"]
+        name_tpl = filename if filename not in (None, "") else config["filename_template"]
+
+        path_template.validate_template(sub_tpl, "子路径模板")
+        path_template.validate_template(name_tpl, "文件名模板")
+
+        video_detail = await self.video_service.get_video_detail(video_id)
+        if not video_detail:
+            raise ValueError("视频不存在或获取失败")
+
+        best_stream = self._get_best_stream(video_detail.stream_urls)
+        quality = best_stream[1] if best_stream else ""
+
+        rel_path, abs_path, variables = self._resolve_target(video_detail, sub_tpl, name_tpl, quality)
+        return {
+            "sub_path": os.path.dirname(rel_path),
+            "filename": os.path.basename(rel_path),
+            "rel_path": rel_path,
+            "absolute_path": str(abs_path),
+            "exists": abs_path.exists(),
+            "variables": variables,
+        }
+
+    # ------------------------------------------------------------------
+    # 开始下载
+    # ------------------------------------------------------------------
+    async def start_download(
+        self,
+        video_id: str,
+        force: bool = False,
+        sub_path: Optional[str] = None,
+        filename: Optional[str] = None,
+    ):
         """
         启动下载
+
         :param video_id: 视频ID
-        :param force: 是否强制重新下载已存在的视频
+        :param force: 二次确认后置为 True，覆盖已有记录/文件并重新下载
+        :param sub_path: 本次下载使用的子路径模板（留空则用全局设置）
+        :param filename: 本次下载使用的文件名模板（留空则用全局设置）
         """
-        # 先检查是否有相同ID的下载记录
         existing_download = await self.check_existing_download(video_id)
-        
+
+        # 未二次确认时，先判断是否需要用户确认
         if existing_download and not force:
+            conflict = self._conflict_from_record(existing_download)
+            if conflict:
+                logger.info(f"下载冲突需确认: {video_id} -> {conflict['type']}")
                 return {
-                    "status": "warning",
-                "message": "视频已在下载列表中",
-                    "existing_download": existing_download
+                    "status": "conflict",
+                    "message": conflict["message"],
+                    "conflict": conflict,
                 }
-        elif existing_download and force:
-            # 删除现有下载
-            await self.delete_download(video_id)
-            
+
         try:
             # 获取视频详情
             video_detail = await self.video_service.get_video_detail(video_id)
             if not video_detail:
                 return {"status": "error", "message": "视频不存在或获取失败"}
-            
+
             # 选择最佳的下载URL
-            best_url = self._get_best_stream_url(video_detail.stream_urls)
-            if not best_url:
+            best_stream = self._get_best_stream(video_detail.stream_urls)
+            if not best_stream:
                 return {"status": "error", "message": "未找到有效的下载链接"}
-            
-            # 优先使用副标题作为文件名，如果没有副标题则使用标题
-            if video_detail.subtitle:
-                filename = self._sanitize_filename(video_detail.subtitle)
-            else:
-                filename = self._sanitize_filename(video_detail.title)
-            
-            # 确保文件名唯一
-            filename = f"{video_id}_{filename}.mp4"
-            
-            # 创建下载记录
-            file_path = settings.DOWNLOAD_PATH / filename
-            
+            best_url, quality = best_stream
+
+            # 解析命名模板
+            config = await self.get_download_settings()
+            sub_tpl = sub_path if sub_path not in (None, "") else config["sub_path_template"]
+            name_tpl = filename if filename not in (None, "") else config["filename_template"]
+
+            path_template.validate_template(sub_tpl, "子路径模板")
+            path_template.validate_template(name_tpl, "文件名模板")
+
+            rel_path, abs_path, variables = self._resolve_target(
+                video_detail, sub_tpl, name_tpl, quality
+            )
+
+            # 目标文件已存在（同名但不同视频，或用户换了一套模板）→ 自动改名，绝不覆盖别人的文件
+            renamed = False
+            old_rel_path = self._rel_path_of(existing_download) if existing_download else ""
+            if abs_path.exists() and old_rel_path != rel_path:
+                abs_path = path_template.unique_path(abs_path)
+                rel_path = str(abs_path.relative_to(settings.DOWNLOAD_PATH))
+                renamed = True
+                logger.info(f"目标文件已存在，自动重命名: {rel_path}")
+
+            # 二次确认后重新下载：先清掉旧记录与旧文件
+            if existing_download and force:
+                try:
+                    await self.delete_download(video_id)
+                except Exception as delete_error:
+                    logger.warning(f"清理旧下载失败（继续下载）: {delete_error}")
+            elif existing_download and old_rel_path and old_rel_path != rel_path:
+                # 失败/取消后的重下，且路径变了：清理旧的残留文件
+                try:
+                    self._absolute_path(old_rel_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+            abs_path.parent.mkdir(parents=True, exist_ok=True)
+
             # 预下载封面到本地（不阻塞主流程）
-            # 如果下载失败也不影响视频下载，用户访问时会自动重试
             asyncio.create_task(self.download_cover(video_id, video_detail.cover_url))
-            
-            # 写入数据库（
+
+            # 写入数据库
             async with aiosqlite.connect(self.db_path) as conn:
                 await conn.execute(
-                    "INSERT OR REPLACE INTO downloads (video_id, title, filename, cover_url, url, status, total_size, downloaded, retry_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO downloads "
+                    "(video_id, title, filename, sub_path, rel_path, vars, cover_url, url, "
+                    " status, total_size, downloaded, retry_count, error_message, completed_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
-                        video_id, 
-                        video_detail.title, 
-                        filename, 
-                        video_detail.cover_url, 
-                        best_url, 
+                        video_id,
+                        video_detail.title,
+                        os.path.basename(rel_path),
+                        os.path.dirname(rel_path),
+                        rel_path,
+                        json.dumps(variables, ensure_ascii=False),
+                        video_detail.cover_url,
+                        best_url,
                         DownloadStatus.PENDING,
                         0,
                         0,
-                        0
+                        0,
+                        None,
+                        None,
                     )
                 )
                 await conn.commit()
-            
+
             # 创建下载进度对象
             self.active_downloads[video_id] = DownloadProgress(
                 video_id=video_id,
-                filename=filename,
+                filename=os.path.basename(rel_path),
                 title=video_detail.title,
                 cover_url=video_detail.cover_url,
                 url=best_url,
@@ -1029,49 +1350,49 @@ class DownloadManager:
                 downloaded=0,
                 status=DownloadStatus.PENDING,
                 speed=0.0,
-                created_at=datetime.now()
+                created_at=datetime.now(),
+                sub_path=os.path.dirname(rel_path),
+                rel_path=rel_path,
+                variables=variables,
             )
-            
+
             # 广播初始状态
             await self.broadcast_progress(video_id)
-            
+
             # 启动下载任务
-            asyncio.create_task(self.download_file(video_id, best_url, file_path))
-            
-            return {"status": "success", "message": "已开始下载"}
+            asyncio.create_task(self.download_file(video_id, best_url, abs_path))
+
+            message = "已开始下载"
+            if renamed:
+                message = f"目标文件已存在，已改名为 {os.path.basename(rel_path)} 并开始下载"
+            return {
+                "status": "success",
+                "message": message,
+                "video_id": video_id,
+                "rel_path": rel_path,
+                "renamed": renamed,
+            }
+        except path_template.TemplateError as e:
+            logger.warning(f"下载模板非法: {e}")
+            return {"status": "error", "message": str(e)}
         except Exception as e:
             logger.error(f"启动下载失败: {str(e)}")
             return {"status": "error", "message": f"启动下载失败: {str(e)}"}
 
-    def _get_best_stream_url(self, stream_urls):
-        """获取最佳视频流URL"""
+    def _get_best_stream(self, stream_urls):
+        """获取最佳视频流 (url, quality)"""
         if not stream_urls:
             return None
-            
-        # 优先选择高质量流
+
         quality_priority = {"1080p": 1, "720p": 2, "480p": 3, "360p": 4, "240p": 5}
-        
-        # 由于stream_urls是VideoStreamUrl对象列表，我们需要通过属性访问
         sorted_streams = sorted(
-            stream_urls, 
-            key=lambda x: quality_priority.get(x.quality.lower(), 999)
+            stream_urls,
+            key=lambda x: quality_priority.get((x.quality or "").lower(), 999)
         )
-        
-        return sorted_streams[0].url if sorted_streams else None
-    
-    def _sanitize_filename(self, filename):
-        """处理文件名，移除非法字符"""
-        # 替换非法字符
-        illegal_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
-        for char in illegal_chars:
-            filename = filename.replace(char, '_')
-        
-        # 限制长度
-        if len(filename) > 200:
-            name, ext = os.path.splitext(filename)
-            filename = name[:196] + ext
-            
-        return filename
+        if not sorted_streams:
+            return None
+        best = sorted_streams[0]
+        return best.url, (best.quality or "")
 
     async def download_cover(self, video_id: str, cover_url: str) -> bool:
         """

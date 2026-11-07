@@ -397,25 +397,32 @@ export const useDownloadStore = defineStore('download', {
     
     /**
      * 开始下载视频
+     *
+     * 返回后端原始结果：
+     * - status = 'success'  ：已加入下载队列
+     * - status = 'conflict' ：已存在下载记录/文件，调用方需二次确认后以 force=true 重试
+     * - status = 'error'    ：失败
      */
-    async startDownload(videoId: string, force: boolean = false) {
+    async startDownload(
+      videoId: string,
+      force: boolean = false,
+      options: { subPath?: string; filename?: string } = {}
+    ) {
       try {
-        const result = await DownloadApi.startDownload(videoId, force);
-        
+        const result = await DownloadApi.startDownload(videoId, force, options);
+
         if (result.status === 'success') {
-          ElMessage.success('开始下载');
-          return true;
-        } else if (result.status === 'warning' && result.existing_download) {
-          // 视频已经下载过，询问用户
           return result;
-        } else {
-          ElMessage.error(result.message || '开始下载失败');
-          return false;
         }
+        if (result.status === 'conflict') {
+          return result;
+        }
+        ElMessage.error(result.message || '开始下载失败');
+        return result;
       } catch (error) {
         console.error('开始下载失败:', error);
         ElMessage.error('开始下载失败');
-        return false;
+        return { status: 'error', message: '开始下载失败' } as any;
       }
     },
     

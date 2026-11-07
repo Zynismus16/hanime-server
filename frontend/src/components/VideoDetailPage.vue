@@ -57,6 +57,10 @@
             <el-button type="primary" :loading="isDownloading" @click="handleDownload">
               <el-icon><Download /></el-icon> 下载
             </el-button>
+
+            <el-button :loading="isDownloading" @click="openDownloadPathDialog" title="自定义子路径与文件名">
+              <el-icon><FolderOpened /></el-icon> 下载到…
+            </el-button>
             
             <!-- 如果有系列，则添加一个系列下载按钮 -->
             <el-button v-if="hasSeriesVideos" type="success" @click="openSeriesDialog">
@@ -192,6 +196,17 @@
       </template>
     </el-dialog>
 
+    <!-- 自定义下载位置 -->
+    <DownloadPathDialog
+      v-model="downloadPathDialogVisible"
+      mode="download"
+      :video-id="videoDetail.video_id"
+      :initial-sub-path="customTarget.subPath"
+      :initial-filename="customTarget.filename"
+      :settings="downloadSettings"
+      @submit="handleCustomDownload"
+    />
+
     <!-- 返回顶部按钮 -->
     <el-backtop :right="20" :bottom="20"></el-backtop>
   </div>
@@ -207,8 +222,11 @@ import VideoSection from '../components/VideoSection.vue';
 import { ElMessage, ElNotification, ElMessageBox } from 'element-plus';
 import VideoPlayer from './VideoPlayer.vue';
 import VideoComments from './VideoComments.vue';
-import { View, Calendar, ArrowUp, ArrowDown, Download, VideoCamera, Collection, InfoFilled } from '@element-plus/icons-vue';
+import DownloadPathDialog from './DownloadPathDialog.vue';
+import { View, Calendar, ArrowUp, ArrowDown, Download, VideoCamera, Collection, InfoFilled, FolderOpened } from '@element-plus/icons-vue';
 import { useDownloadStore } from '../stores/download';
+import { DownloadApi } from '../api/download';
+import type { DownloadConflict, DownloadSettings } from '../types/download';
 import defaultAvatar from '../assets/default-avatar.svg';
 
 export default defineComponent({
@@ -218,6 +236,7 @@ export default defineComponent({
     VideoSection,
     VideoPlayer,
     VideoComments,
+    DownloadPathDialog,
     View,
     Calendar,
     ArrowUp,
@@ -225,7 +244,8 @@ export default defineComponent({
     Download,
     VideoCamera,
     Collection,
-    InfoFilled
+    InfoFilled,
+    FolderOpened
   },
   setup() {
     const route = useRoute();
@@ -292,84 +312,131 @@ export default defineComponent({
       console.log(`[Debug] ${message}`);
     };
 
-    // 处理下载命令
+    // 自定义下载位置相关状态
+    const downloadPathDialogVisible = ref(false);
+    const downloadSettings = ref<DownloadSettings | null>(null);
+    const customTarget = ref<{ subPath: string; filename: string }>({ subPath: '', filename: '' });
+
+    // 处理下载命令（使用全局命名设置）
     const handleDownload = async () => {
+      await startDownloadProcess(false);
+    };
+
+    // 打开「下载到…」弹窗，自定义本次下载的子路径与文件名
+    const openDownloadPathDialog = async () => {
+      if (!videoDetail.value.video_id) {
+        ElMessage.warning('视频尚未加载完成');
+        return;
+      }
+      if (!downloadSettings.value) {
+        downloadSettings.value = await DownloadApi.getSettings();
+      }
+      customTarget.value = {
+        subPath: downloadSettings.value?.sub_path_template || '',
+        filename: downloadSettings.value?.filename_template || '{video_id}_{title}'
+      };
+      downloadPathDialogVisible.value = true;
+    };
+
+    // 弹窗确认后开始下载
+    const handleCustomDownload = async (payload: { subPath: string; filename: string }) => {
+      await startDownloadProcess(false, payload);
+    };
+
+    // 开始下载流程
+    // force=false：由后端判断是否冲突（已在列表/已下载），冲突则弹二次确认
+    // force=true ：用户已确认，覆盖旧记录重新下载
+    const startDownloadProcess = async (
+      force: boolean,
+      options: { subPath?: string; filename?: string } = {}
+    ) => {
+      if (!videoDetail.value.video_id) return;
+      isDownloading.value = true;
+
       try {
-        // 先检查视频是否已经下载
-        if (isVideoAlreadyDownloaded(videoDetail.value.video_id)) {
-          ElMessageBox.confirm(
-            '该视频已经下载过，是否重新下载？',
-            '确认操作',
-            {
-              confirmButtonText: '重新下载',
-              cancelButtonText: '取消',
-              type: 'warning'
-            }
-          ).then(async () => {
-            await startDownloadProcess(true);
-          }).catch(() => {
-            ElMessage.info('已取消下载');
-          });
-          return;
+        const result: any = await downloadStore.startDownload(
+          videoDetail.value.video_id,
+          force,
+          options
+        );
+
+        if (result && result.status === 'success') {
+          ElMessage.success(result.renamed ? result.message : '开始下载视频');
+          notifyDownloadStarted(result.rel_path);
+        } else if (result && result.status === 'conflict' && result.conflict) {
+          await confirmReDownload(result.conflict, options);
+        } else if (result && result.status === 'error') {
+          ElMessage.error(result.message || '下载失败');
         }
-        
-        // 视频未下载，直接开始下载
-        await startDownloadProcess(false);
       } catch (error) {
         console.error('下载出错:', error);
         ElMessage.error('下载请求失败');
-        isDownloading.value = false;
-      }
-    };
-    
-    // 开始下载流程
-    const startDownloadProcess = async (force: boolean) => {
-      isDownloading.value = true;
-      
-      try {
-        // 直接下载视频（使用最高清晰度）
-        const result = await downloadStore.startDownload(videoDetail.value.video_id, force);
-        
-        if (result === true) {
-      ElMessage.success('开始下载视频');
-          // 创建可点击通知
-          ElNotification({
-            title: '下载已开始',
-            message: h('div', {
-              class: 'clickable-notification',
-              onClick: () => router.push('/downloads')
-            }, [
-              h('p', '可在下载管理页面查看详情'),
-              h('el-button', {
-                size: 'small',
-                type: 'primary',
-                style: 'margin-top: 8px; width: 100%;'
-              }, '前往下载管理')
-            ]),
-            type: 'success',
-            duration: 5000,
-            position: 'bottom-right'
-          });
-        } else if (result && result.status === 'warning') {
-          // 视频已经下载过，询问是否重新下载
-          ElMessageBox.confirm(
-            '该视频已下载过，是否重新下载？',
-            '确认操作',
-            {
-              confirmButtonText: '重新下载',
-              cancelButtonText: '取消',
-              type: 'warning'
-            }
-          ).then(async () => {
-            await downloadStore.startDownload(videoDetail.value.video_id, true);
-            ElMessage.success('开始重新下载');
-          }).catch(() => {
-            ElMessage.info('已取消下载');
-          });
-        }
       } finally {
         isDownloading.value = false;
       }
+    };
+
+    // 重复下载二次确认
+    const confirmReDownload = async (
+      conflict: DownloadConflict,
+      options: { subPath?: string; filename?: string }
+    ) => {
+      const detailText = conflict.detail ? `（${conflict.detail}）` : '';
+      const tipMap: Record<string, string> = {
+        in_progress: '该视频已在下载列表中，继续将取消当前任务并重新开始下载。',
+        completed: '该视频已下载完成，继续将删除原文件并重新下载。',
+        completed_missing: '下载记录存在但文件已丢失，继续将重新下载。'
+      };
+      const tip = tipMap[conflict.type] || '继续将重新下载该视频。';
+
+      try {
+        await ElMessageBox.confirm(
+          `${conflict.message}${detailText}。${tip}`,
+          '重复下载确认',
+          {
+            confirmButtonText: '重新下载',
+            cancelButtonText: '取消',
+            type: 'warning',
+            confirmButtonClass: 'el-button--warning'
+          }
+        );
+      } catch {
+        ElMessage.info('已取消下载');
+        return;
+      }
+
+      const retry: any = await downloadStore.startDownload(
+        videoDetail.value.video_id,
+        true,
+        options
+      );
+      if (retry && retry.status === 'success') {
+        ElMessage.success('开始重新下载');
+        notifyDownloadStarted(retry.rel_path);
+      } else if (retry && retry.status === 'error') {
+        ElMessage.error(retry.message || '重新下载失败');
+      }
+    };
+
+    // 创建可点击的「下载已开始」通知
+    const notifyDownloadStarted = (relPath?: string) => {
+      ElNotification({
+        title: '下载已开始',
+        message: h('div', {
+          class: 'clickable-notification',
+          onClick: () => router.push('/downloads')
+        }, [
+          h('p', relPath ? `保存到：${relPath}` : '可在下载管理页面查看详情'),
+          h('el-button', {
+            size: 'small',
+            type: 'primary',
+            style: 'margin-top: 8px; width: 100%;'
+          }, '前往下载管理')
+        ]),
+        type: 'success',
+        duration: 5000,
+        position: 'bottom-right'
+      });
     };
 
     // 判断是否为推荐质量
@@ -676,10 +743,14 @@ export default defineComponent({
           )
           .then(results => {
             // 这里可以处理所有下载请求的结果，但不会阻塞用户界面
-            const successCount = results.filter(result => result === true).length;
+            const successCount = results.filter(result => result && result.status === 'success').length;
+            const conflictCount = results.filter(result => result && result.status === 'conflict').length;
             const failedCount = results.filter(result => result && result.status === 'error').length;
-            
-            console.log(`系列下载结果: 成功=${successCount}, 失败=${failedCount}, 已存在=${alreadyDownloadedCount}`);
+
+            console.log(`系列下载结果: 成功=${successCount}, 冲突=${conflictCount}, 失败=${failedCount}, 已存在=${alreadyDownloadedCount}`);
+            if (conflictCount > 0) {
+              ElMessage.warning(`${conflictCount} 个视频已在下载列表中，已跳过`);
+            }
           });
         }
       } catch (error) {
@@ -744,6 +815,11 @@ export default defineComponent({
       isDownloading,
       videoPlayerRef,
       handleDownload,
+      downloadPathDialogVisible,
+      downloadSettings,
+      customTarget,
+      openDownloadPathDialog,
+      handleCustomDownload,
       formatDate,
       formatViewCount,
       formatFileSize,

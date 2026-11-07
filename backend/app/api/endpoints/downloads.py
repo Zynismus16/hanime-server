@@ -1,6 +1,12 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, Depends, HTTPException
 from app.services.download_service import download_manager
-from app.models.download import DownloadRequest, DownloadAction
+from app.models.download import (
+    DownloadRequest,
+    DownloadAction,
+    DownloadSettings,
+    PathPreviewRequest,
+)
+from app.utils import path_template
 from typing import List, Dict, Any, Optional
 from app.config import settings, logger
 from fastapi.responses import FileResponse
@@ -45,10 +51,76 @@ async def get_download_history() -> List[Dict[str, Any]]:
 
 @router.post("/start")
 async def start_download(download_request: DownloadRequest):
-    """开始下载视频"""
+    """
+    开始下载视频
+
+    - 若该视频已在下载列表 / 已下载完成，返回 `status="conflict"`，前端弹出二次确认
+    - 用户确认后带 `force=true` 再次调用即覆盖重下
+    """
     return await download_manager.start_download(
         download_request.video_id,
-        download_request.force
+        download_request.force,
+        sub_path=download_request.sub_path,
+        filename=download_request.filename,
+    )
+
+
+@router.post("/check")
+async def check_download(download_request: DownloadRequest):
+    """下载前置检查：是否需要二次确认"""
+    return await download_manager.check_download_conflict(
+        download_request.video_id,
+        sub_path=download_request.sub_path,
+        filename=download_request.filename,
+    )
+
+
+@router.post("/preview")
+async def preview_download_path(preview_request: PathPreviewRequest):
+    """按模板预览落盘路径（不创建文件）"""
+    try:
+        return await download_manager.preview_target(
+            preview_request.video_id,
+            sub_path=preview_request.sub_path,
+            filename=preview_request.filename,
+        )
+    except path_template.TemplateError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.get("/settings", response_model=DownloadSettings)
+async def get_download_settings():
+    """获取下载命名设置与可用变量"""
+    current = await download_manager.get_download_settings()
+    return DownloadSettings(
+        sub_path_template=current["sub_path_template"],
+        filename_template=current["filename_template"],
+        variables=path_template.VARIABLES,
+        examples=[
+            {"name": "按发行商 / 系列分层", "sub_path": "{studio}/{series}", "filename": "{title}"},
+            {"name": "按发布年月分层", "sub_path": "{year}/{month}", "filename": "{video_id}_{title}"},
+            {"name": "带清晰度后缀", "sub_path": "{studio}", "filename": "{title} [{quality}]"},
+        ],
+    )
+
+
+@router.put("/settings", response_model=DownloadSettings)
+async def update_download_settings(payload: DownloadSettings):
+    """保存下载命名设置"""
+    try:
+        saved = await download_manager.save_download_settings(
+            payload.sub_path_template, payload.filename_template
+        )
+    except path_template.TemplateError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return DownloadSettings(
+        sub_path_template=saved["sub_path_template"],
+        filename_template=saved["filename_template"],
+        variables=path_template.VARIABLES,
+        examples=[],
     )
 
 
@@ -89,7 +161,7 @@ async def get_downloaded_file(video_id: str):
     if download_info['status'] != 'completed':
         return {"status": "error", "message": "下载尚未完成"}
     
-    file_path = settings.DOWNLOAD_PATH / download_info['filename']
+    file_path = download_manager.absolute_path_of(download_info)
     if not os.path.exists(file_path):
         return {"status": "error", "message": "文件不存在"}
     

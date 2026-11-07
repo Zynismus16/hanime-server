@@ -1,5 +1,12 @@
 import request from '../utils/request.ts';
-import { DownloadProgress, DownloadActionType } from '../types/download';
+import type {
+  DownloadProgress,
+  DownloadActionType,
+  DownloadStartResult,
+  DownloadSettings,
+  DownloadCheckResult,
+  PathPreview,
+} from '../types/download';
 
 /**
  * 下载相关API服务
@@ -21,18 +28,92 @@ export const DownloadApi = {
   /**
    * 开始下载视频
    * @param videoId 视频ID
-   * @param force 是否强制重新下载
+   * @param force 是否强制重新下载（二次确认后传 true）
+   * @param options 本次下载的路径模板覆盖
    */
-  startDownload: async (videoId: string, force: boolean = false) => {
+  startDownload: async (
+    videoId: string,
+    force: boolean = false,
+    options: { subPath?: string; filename?: string } = {}
+  ): Promise<DownloadStartResult> => {
     try {
-      const response = await request.post('/downloads/start', {
+      const response = await request.post<DownloadStartResult>('/downloads/start', {
         video_id: videoId,
-        force
+        force,
+        sub_path: options.subPath,
+        filename: options.filename,
       });
       return response.data;
     } catch (error) {
       console.error('开始下载失败:', error);
       return { status: 'error', message: '开始下载失败' };
+    }
+  },
+
+  /**
+   * 下载前置检查：判断是否需要二次确认
+   */
+  checkDownload: async (videoId: string): Promise<DownloadCheckResult | null> => {
+    try {
+      const response = await request.post<DownloadCheckResult>('/downloads/check', {
+        video_id: videoId,
+      });
+      return response.data;
+    } catch (error) {
+      console.error('下载检查失败:', error);
+      return null;
+    }
+  },
+
+  /**
+   * 预览按模板生成的落盘路径
+   */
+  previewPath: async (
+    videoId: string,
+    options: { subPath?: string; filename?: string } = {}
+  ): Promise<PathPreview | null> => {
+    try {
+      const response = await request.post<PathPreview>('/downloads/preview', {
+        video_id: videoId,
+        sub_path: options.subPath,
+        filename: options.filename,
+      });
+      return response.data;
+    } catch (error) {
+      console.error('路径预览失败:', error);
+      return null;
+    }
+  },
+
+  /**
+   * 获取下载命名设置
+   */
+  getSettings: async (): Promise<DownloadSettings | null> => {
+    try {
+      const response = await request.get<DownloadSettings>('/downloads/settings');
+      return response.data;
+    } catch (error) {
+      console.error('获取下载设置失败:', error);
+      return null;
+    }
+  },
+
+  /**
+   * 保存下载命名设置
+   */
+  saveSettings: async (
+    subPathTemplate: string,
+    filenameTemplate: string
+  ): Promise<{ ok: boolean; message?: string; settings?: DownloadSettings }> => {
+    try {
+      const response = await request.put<DownloadSettings>('/downloads/settings', {
+        sub_path_template: subPathTemplate,
+        filename_template: filenameTemplate,
+      });
+      return { ok: true, settings: response.data };
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail;
+      return { ok: false, message: detail || '保存失败' };
     }
   },
 

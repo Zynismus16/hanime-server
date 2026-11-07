@@ -40,6 +40,12 @@
             <span v-else>{{ extractFilename(download.filename) || download.title }}</span>
           </h3>
         </div>
+
+        <!-- 保存路径 -->
+        <div v-if="download.rel_path" class="item-path" :title="download.rel_path">
+          <el-icon><FolderOpened /></el-icon>
+          <span>{{ download.rel_path }}</span>
+        </div>
         
         <div class="item-meta">
           <el-tag
@@ -647,6 +653,23 @@ watch(() => props.download.status, (newStatus) => {
 
 .item-title-link:hover {
   color: var(--primary-color);
+}
+
+.item-path {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: var(--text-secondary-color);
+  max-width: 100%;
+}
+
+.item-path span {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 .item-meta {
