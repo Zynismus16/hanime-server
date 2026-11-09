@@ -30,3 +30,6 @@ backend/downloads/
 
 *.sqlite
 *.ps1
+# 运行时数据（docker compose 挂载目录）
+data/
+backend/logs/

@@ -4,14 +4,25 @@
 
 # Dependencies
 node_modules
+**/node_modules
 
 # Build Output
 dist
+**/dist
 out
 
 # Logs
 logs
+**/logs
 *.log
+
+# 运行时数据（不要打进镜像）
+data
+backend/db
+backend/downloads
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
 
 # Environment Variables
 .env
@@ -24,9 +35,10 @@ logs
 *.swp
 *.swo
 
-# Backend Specific
-backend/db/
-backend/downloads/
+# OS
+.DS_Store
+Thumbs.db
 
-*.sqlite
+# 文档与杂项
 *.ps1
+docs

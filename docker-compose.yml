@@ -1,19 +1,52 @@
 services:
   app:
-    image: heisenyu/hanime-server:latest
+    # 默认从本仓库源码构建（包含下载命名模板等改造）
+    # 想直接用官方镜像，把 image 改成 heisenyu/hanime-server:latest 并注释掉 build
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hanime-server:local
     container_name: hanime-server
     restart: unless-stopped
+    init: true
     depends_on:
-      - cf-bypass
+      cf-bypass:
+        condition: service_started
+
+    # 变量优先级：environment > .env > 代码默认值
+    # .env 由 compose 自动读取（同目录），也可直接改这里的默认值
     environment:
-      - USE_PROXY=${USE_PROXY:-false}
-      - PROXY_URL=${PROXY_URL:-}
-      - CLOUDFLARE_BYPASS_SERVICE_URL=http://cf-bypass:8000
+      TZ: ${TZ:-Asia/Shanghai}
+      USE_PROXY: ${USE_PROXY:-false}
+      PROXY_URL: ${PROXY_URL:-}
+      USE_DOWNLOAD_PROXY: ${USE_DOWNLOAD_PROXY:-false}
+      DOWNLOAD_PROXY_URL: ${DOWNLOAD_PROXY_URL:-}
+      CLOUDFLARE_BYPASS_SERVICE_URL: http://cf-bypass:8000
+      DOWNLOAD_PATH: /app/backend/downloads
+      DB_PATH: /app/backend/db
+      COVER_PATH: /app/backend/downloads/covers
+      LOG_PATH: /app/backend/logs
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      USE_LOG_FILE: ${USE_LOG_FILE:-false}
+      # 留空则使用代码内置默认值 {video_id}_{title}
+      DOWNLOAD_SUB_PATH_TEMPLATE: ${DOWNLOAD_SUB_PATH_TEMPLATE:-}
+      DOWNLOAD_FILENAME_TEMPLATE: ${DOWNLOAD_FILENAME_TEMPLATE:-}
+
     volumes:
+      # 下载文件（含封面）、SQLite 记录、日志，全部落宿主机 ./data
       - ./data/downloads:/app/backend/downloads
       - ./data/db:/app/backend/db
+      - ./data/logs:/app/backend/logs
+
     ports:
-      - "7788:7788"
+      - "${APP_PORT:-7788}:7788"
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7788/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
 
   cf-bypass:
     image: ghcr.io/sarperavci/cloudflarebypassforscraping:latest

@@ -229,91 +229,89 @@ TODO：
 
 ### Docker 部署（推荐）
 
-现在可以通过 Docker Compose 一键部署整个应用：
+本仓库相对上游增加了**下载命名模板、下载记录入库、重复下载二次确认**等改造，镜像需要从本地源码构建。
 
-1. 创建 `docker-compose.yml` 文件：
-
-```yaml
-version: '3'
-services:
-  hanime-server:
-    image: heisenyu/hanime-server:latest
-    environment:
-      - USE_PROXY=${USE_PROXY:-true}                  # 是否使用代理
-      - PROXY_URL=${PROXY_URL:-}                       # 代理地址
-      - USE_DOWNLOAD_PROXY=${USE_DOWNLOAD_PROXY:-false}  # 下载是否与使用代理
-      - CLOUDFLARE_BYPASS_SERVICE_URL=http://cf-bypass:8000
-    depends_on:
-      - cf-bypass
-    ports:
-      - "7788:7788"
-    volumes:
-      - ./downloads:/app/backend/downloads
-      - ./db:/app/backend/db
-    restart: unless-stopped
-
-  cf-bypass:
-    image: ghcr.io/sarperavci/cloudflarebypassforscraping:latest
-    container_name: cf-bypass
-    restart: unless-stopped
-    environment:
-      - WORKERS=1
-    deploy:
-      resources:
-        limits:
-           memory: 1G
-           cpus: '1.0'
-    shm_size: 1g
-```
-
-2. 代理设置说明：
-   - `USE_PROXY`: 设置为 `true` 表示元数据获取使用代理（国内网络必须开启）
-   - `PROXY_URL`: 代理服务器地址
-   - `USE_DOWNLOAD_PROXY`: 设置为 `true` 表示下载视频时使用代理，默认为 `false`（经测试，下载视频可以不走代理）
-
-3. 运行容器：
+#### 1. 准备代码与环境变量
 
 ```bash
-docker-compose up -d
+git clone https://github.com/Zynismus16/hanime-server.git
+cd hanime-server
+cp .env.example .env
 ```
 
-4. 访问应用：
-   - 前端界面：http://localhost:7788
+编辑 `.env`，至少确认代理配置（元数据抓取要访问 hanime1.me，国内网络需要代理）：
 
-> 💡 **温馨提示**: 首次进入时，系统会自动进行 Cloudflare 5s 盾验证，耗时可能较长（5-10秒），请耐心等待。验证成功后，凭证会被缓存，后续访问将极其流畅。
+```ini
+USE_PROXY=True
+PROXY_URL=http://192.168.1.2:7890
+```
+
+> 视频下载默认直连 CDN，`USE_DOWNLOAD_PROXY` 保持 `False` 即可；下载慢再打开。
+
+#### 2. 启动
+
+```bash
+docker compose up -d --build
+```
+
+首次构建约 3-8 分钟（前端 Node 构建 + Python 依赖安装）。完成后访问：
+
+- 前端界面：http://localhost:7788
+- 健康检查：http://localhost:7788/api/health
+
+```bash
+docker compose ps          # STATUS 显示 healthy 即就绪
+docker compose logs -f app # 查看启动日志
+```
+
+#### 3. 目录与持久化
+
+| 宿主机 | 容器内 | 内容 |
+|---|---|---|
+| `./data/downloads` | `/app/backend/downloads` | 视频文件、`covers/` 封面 |
+| `./data/db` | `/app/backend/db` | `downloads.db`（下载记录 + 命名设置） |
+| `./data/logs` | `/app/backend/logs` | `USE_LOG_FILE=true` 时的滚动日志 |
+
+三个目录首次启动自动创建，迁移机器时整目录拷走即可。
+
+命名规则有两个来源，**页面设置优先**：
+
+1. 页面「下载管理 → 命名设置」，保存在 SQLite；
+2. `.env` 中的 `DOWNLOAD_SUB_PATH_TEMPLATE` / `DOWNLOAD_FILENAME_TEMPLATE`，作为初始默认值。
+
+变量说明见上文「📁 下载命名规则（自定义子路径 / 文件名）」。
+
+#### 4. 常用操作
+
+```bash
+docker compose logs -f app        # 实时日志
+docker compose down               # 停止（./data 保留）
+docker compose up -d --build      # 改代码后重建
+```
+
+- 改端口：`.env` 中加 `APP_PORT=8899`。
+- 换官方镜像：注释 compose 里的 `build:`，`image:` 改为 `heisenyu/hanime-server:latest`（注意官方镜像**不含**本仓库的下载改造）。
+- 只想跑后端调试：`docker compose run --rm --service-ports app bash`。
+
+#### 5. 注意事项
+
+- 容器内 nginx 与后端均以 root 运行，`./data` 下文件属主为 root。需要非 root 属主时执行 `sudo chown -R 1000:1000 data`。
+- `cf-bypass` 镜像来自 ghcr.io，拉取失败时先单独 `docker pull ghcr.io/sarperavci/cloudflarebypassforscraping:latest`，或给 Docker 配置镜像加速。
+- 首次访问需要过 Cloudflare 5 秒盾，等待 5-10 秒属正常，凭证会缓存。
+- 容器停止时先收到 SIGTERM，正在进行的下载会中断并在下次启动时按 `downloading` 状态自动续传。
 
 ### NAS 部署指南
 
-本项目适合在各类NAS系统上部署：
+同一份 `docker-compose.yml` 可直接用于 NAS：
 
-#### 群晖 (Synology) NAS 部署
-1. 在套件中心安装Docker
-2. 在Docker应用中创建上述docker-compose.yml文件
-3. 映射下载目录到您的媒体文件夹
+- **群晖 Synology**：套件中心安装 Container Manager →「项目」→ 新建 → 选择本仓库目录下的 `docker-compose.yml`；或 SSH 进 NAS 后在该目录执行 `docker compose up -d --build`。下载目录建议改成 `/volume1/media/anime:/app/backend/downloads`。
+- **威联通 QNAP**：Container Station →「应用程序」→ 创建 → 粘贴 compose 内容，同样按需替换 `./data/*` 为共享文件夹路径。
+- 其他系统只要支持 Docker + Compose v2 即可。
 
-#### 威联通 (QNAP) NAS 部署
-1. 通过Container Station安装
-2. 使用上述docker-compose配置
-3. 映射存储卷到媒体文件夹
+NAS 上注意两点：
 
-#### 其他 NAS 系统
-只要支持Docker，均可按照类似步骤进行部署
-
-### 定制构建
-
-如果您希望自行构建 Docker 镜像：
-
-```bash
-# 克隆仓库
-git clone https://github.com/heisenyu/hanime-server
-cd hanime-server
-
-# 构建镜像
-docker build -t hanime-server:custom .
-
-# 运行容器
-docker run -d -p 7788:7788 -p 8000:8000 -v $(pwd)/downloads:/app/backend/downloads hanime-server:custom
-```
+1. 构建需要拉取 node/python 基础镜像和依赖，网络差时先在别的机器 `docker save` 再导入。
+2. 下载目录若指向已有媒体库，建议单独建子目录，避免命名清洗规则影响其他文件。
 
 ### 手动部署
 

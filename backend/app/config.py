@@ -77,9 +77,9 @@ logger.info(f"下载目录: {settings.DOWNLOAD_PATH}")
 logger.info(f"数据库目录: {settings.DB_PATH}")
 logger.info(f"封面目录: {settings.COVER_PATH}")
 
-# 确保下载目录存在
-settings.DOWNLOAD_PATH.mkdir(exist_ok=True)
-settings.DB_PATH.mkdir(exist_ok=True)
+# 确保下载目录存在（容器里挂载的自定义路径可能有多级）
+settings.DOWNLOAD_PATH.mkdir(parents=True, exist_ok=True)
+settings.DB_PATH.mkdir(parents=True, exist_ok=True)
 settings.COVER_PATH.mkdir(parents=True, exist_ok=True)
 
 
@@ -99,7 +99,7 @@ handlers = [
 # 根据开关决定是否添加文件日志处理程序
 if settings.USE_LOG_FILE:
     # 确保日志目录存在
-    settings.LOG_PATH.mkdir(exist_ok=True)
+    settings.LOG_PATH.mkdir(parents=True, exist_ok=True)
     logger.info(f"日志目录: {settings.LOG_PATH}")
     handlers.append({
         "sink": str(settings.LOG_PATH / "app.log"),

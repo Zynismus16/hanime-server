@@ -53,6 +53,9 @@ show_banner() {
 # 启动 Nginx
 start_nginx() {
     print_step "启动 Nginx 服务..."
+    if ! nginx -t 2>&1; then
+        handle_error "Nginx 配置检查" 1
+    fi
     if service nginx start; then
         print_info "✓ Nginx 服务启动成功"
         # 获取主机IP地址
@@ -72,13 +75,17 @@ start_nginx() {
 start_backend() {
     print_step "启动后端服务..."
     cd /app/backend || handle_error "切换到后端目录" $?
-    
+
     print_info "正在初始化后端服务..."
     echo -e "  ${BOLD}工作目录:${NC} $(pwd)"
     echo -e "  ${BOLD}Python版本:${NC} $(python3 --version)"
+    echo -e "  ${BOLD}下载目录:${NC} ${DOWNLOAD_PATH:-/app/backend/downloads}"
+    echo -e "  ${BOLD}数据目录:${NC} ${DB_PATH:-/app/backend/db}"
     echo ""
-    
-    python3 main.py || handle_error "启动 Python 后端" $?
+
+    # exec 让 uvicorn 接管 PID1（配合 compose 的 init: true），
+    # docker stop 时能收到 SIGTERM 并优雅关闭，正在写的下载任务不会被硬杀
+    exec python3 main.py
 }
 
 # 主函数
@@ -86,10 +93,10 @@ main() {
     show_banner
     start_nginx
     start_backend
-    
-    # 这行代码通常不会执行到，因为 python3 main.py 会阻塞
-    # 如果执行到这里，说明所有进程都已经退出
+
+    # 正常情况下 start_backend 已经 exec，不会走到这里
     print_error "所有服务已意外停止。请检查日志获取更多信息。"
+    exit 1
 }
 
 # 执行主函数
